@@ -400,7 +400,8 @@ static void mainLoop()
             _main_game_paused = 0;
         }
 
-        if ((gDude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        if ((gDude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
+            && !realTimeCombatIsDeathAnimationPending()) {
             endgameSetupDeathEnding(ENDGAME_DEATH_ENDING_REASON_DEATH);
             _main_show_death_scene = 1;
             _game_user_wants_to_quit = GAME_QUIT_REQUEST_MAIN_MENU;

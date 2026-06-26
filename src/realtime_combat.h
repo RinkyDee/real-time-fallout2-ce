@@ -11,6 +11,7 @@ void realTimeCombatClearPendingMap();
 bool realTimeCombatIsMapEnabled();
 bool realTimeCombatShouldBlockClassicCombat();
 bool realTimeCombatIsEnabled();
+bool realTimeCombatIsDeathAnimationPending();
 bool realTimeCombatHandleTurnBasedCombatRequest(CombatStartData* combatStartData);
 void realTimeCombatTrace(const char* context, CombatStartData* combatStartData);
 void realTimeCombatRefreshCursor();

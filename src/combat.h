@@ -35,6 +35,7 @@ void _combat_give_exps(int exp_points);
 void _combat_turn_run();
 void _combat(CombatStartData* csd);
 void attackInit(Attack* attack, Object* attacker, Object* defender, int hitMode, int hitLocation);
+int attackCompute(Attack* attack);
 int _combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocation);
 int _combat_bullet_start(const Object* attacker, const Object* target);
 void _compute_explosion_on_extras(Attack* attack, bool isFromAttacker, bool isGrenade, bool noDamage);

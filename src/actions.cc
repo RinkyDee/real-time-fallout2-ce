@@ -27,6 +27,7 @@
 #include "proto_instance.h"
 #include "proto_types.h"
 #include "random.h"
+#include "realtime_combat.h"
 #include "scripts.h"
 #include "settings.h"
 #include "sfall_script_hooks.h"
@@ -590,13 +591,15 @@ int _action_attack(Attack* attack)
         return -1;
     }
 
-    if (reg_anim_clear(attack->defender) == -2) {
-        return -1;
-    }
-
-    for (int index = 0; index < attack->extrasLength; index++) {
-        if (reg_anim_clear(attack->extras[index]) == -2) {
+    if (!realTimeCombatIsEnabled()) {
+        if (reg_anim_clear(attack->defender) == -2) {
             return -1;
+        }
+
+        for (int index = 0; index < attack->extrasLength; index++) {
+            if (reg_anim_clear(attack->extras[index]) == -2) {
+                return -1;
+            }
         }
     }
 

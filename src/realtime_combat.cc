@@ -25,6 +25,7 @@
 #include "platform_compat.h"
 #include "scripts.h"
 #include "settings.h"
+#include "svga.h"
 #include "tile.h"
 #include "worldmap.h"
 
@@ -32,10 +33,10 @@ namespace fallout {
 
 static constexpr unsigned int kMoveFrameDelayMs = 75;
 static constexpr int kMovePixelsPerFrame = 4;
-static constexpr int kNpcMovePixelsPerFrame = 3;
+static constexpr int kNpcMovePixelsPerFrame = 2;
 static constexpr int kAttackTargetPadding = 24;
 static constexpr unsigned int kAttackCooldownMs = 650;
-static constexpr unsigned int kNpcAttackCooldownMs = 1200;
+static constexpr unsigned int kNpcAttackCooldownMs = 2200;
 
 static unsigned int gLastMoveFrameTime = 0;
 static unsigned int gLastNpcMoveFrameTime = 0;
@@ -50,7 +51,7 @@ static char gPendingMapName[16];
 static bool gMapTransitionInProgress = false;
 static std::unordered_map<Object*, unsigned int> gNpcLastAttackTimes;
 
-static void realTimeCombatFinalizeAttack();
+static void realTimeCombatFinalizeAttack(Attack* attack);
 
 static bool realTimeCombatNameContains(const char* string, const char* pattern)
 {
@@ -176,6 +177,13 @@ bool realTimeCombatIsEnabled()
         && interfaceBarEnabled()
         && !isoIsDisabled()
         && realTimeCombatIsMapEnabled();
+}
+
+bool realTimeCombatIsDeathAnimationPending()
+{
+    return realTimeCombatIsEnabled()
+        && (gDude->data.critter.combat.results & DAM_DEAD) != 0
+        && animationIsBusy(gDude);
 }
 
 void realTimeCombatTrace(const char* context, CombatStartData* combatStartData)
@@ -345,6 +353,24 @@ static int realTimeCombatAbs(int value)
 static int realTimeCombatSquared(int value)
 {
     return value * value;
+}
+
+static bool realTimeCombatCanInterruptDudeAnimation()
+{
+    return (gDude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) == 0;
+}
+
+static bool realTimeCombatInterruptDudeAnimation()
+{
+    if (!animationIsBusy(gDude)) {
+        return true;
+    }
+
+    if (!realTimeCombatCanInterruptDudeAnimation()) {
+        return false;
+    }
+
+    return reg_anim_clear(gDude) != -2;
 }
 
 static bool realTimeCombatIsReloadHitMode(int hitMode)
@@ -544,9 +570,70 @@ static void realTimeCombatNotifyAttackTarget(Object* target, Object* weapon)
     _combatai_notify_onlookers(target);
 }
 
+static void realTimeCombatPlayAttackAnimation(Object* attacker, Object* target, int hitMode)
+{
+    if (attacker == nullptr || target == nullptr) {
+        return;
+    }
+
+    if ((attacker->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        return;
+    }
+
+    int anim = critterGetAnimationForHitMode(attacker, hitMode);
+    int fid = buildFid(FID_TYPE(attacker->fid), attacker->fid & 0xFFF, anim, (attacker->fid & 0xF000) >> 12, attacker->rotation + 1);
+    if (!artExists(fid)) {
+        return;
+    }
+
+    reg_anim_clear(attacker);
+    reg_anim_begin(ANIMATION_REQUEST_UNRESERVED);
+    animationRegisterRotateToTile(attacker, target->tile);
+    animationRegisterAnimate(attacker, anim, 0);
+    reg_anim_end();
+}
+
+static bool realTimeCombatPerformAttack(Object* attacker, Object* target, int hitMode, bool aiming)
+{
+    if (attacker == nullptr || target == nullptr) {
+        return false;
+    }
+
+    if ((attacker->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0
+        || (target->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
+        return false;
+    }
+
+    int savedActionPoints = attacker->data.critter.combat.ap;
+    int actionPointsRequired = weaponGetActionPointCost(attacker, hitMode, aiming);
+    if (attacker->data.critter.combat.ap < actionPointsRequired) {
+        attacker->data.critter.combat.ap = actionPointsRequired;
+    }
+
+    Attack attack;
+    attackInit(&attack, attacker, target, hitMode, HIT_LOCATION_UNCALLED);
+    int rc = attackCompute(&attack);
+    attacker->data.critter.combat.ap = savedActionPoints;
+
+    if (attacker == gDude) {
+        interfaceRenderActionPoints(attacker->data.critter.combat.ap, _combat_free_move);
+    }
+
+    if (rc == -1) {
+        return false;
+    }
+
+    realTimeCombatFaceObject(attacker, target);
+    realTimeCombatPlayAttackAnimation(attacker, target, hitMode);
+    realTimeCombatFinalizeAttack(&attack);
+    aiInfoSetLastTarget(attacker, target);
+
+    return true;
+}
+
 static bool realTimeCombatAttack(Object* target, int hitMode, bool aiming)
 {
-    if (target == nullptr || animationIsBusy(gDude)) {
+    if (target == nullptr) {
         return false;
     }
 
@@ -559,29 +646,19 @@ static bool realTimeCombatAttack(Object* target, int hitMode, bool aiming)
         return false;
     }
 
-    int savedActionPoints = gDude->data.critter.combat.ap;
-    int actionPointsRequired = weaponGetActionPointCost(gDude, hitMode, aiming);
-    if (gDude->data.critter.combat.ap < actionPointsRequired) {
-        gDude->data.critter.combat.ap = actionPointsRequired;
-    }
-
     gWasMoving = false;
-    int rc = _combat_attack(gDude, target, hitMode, HIT_LOCATION_UNCALLED);
-    gDude->data.critter.combat.ap = savedActionPoints;
-    interfaceRenderActionPoints(gDude->data.critter.combat.ap, _combat_free_move);
-
-    if (rc == 0) {
-        realTimeCombatFinalizeAttack();
+    if (realTimeCombatPerformAttack(gDude, target, hitMode, aiming)) {
         realTimeCombatNotifyAttackTarget(target, critterGetWeaponForHitMode(gDude, hitMode));
         gLastAttackTime = now;
+        return true;
     }
 
-    return rc == 0;
+    return false;
 }
 
 static bool realTimeCombatNpcAttack(Object* attacker, Object* target, int hitMode)
 {
-    if (attacker == nullptr || target == nullptr || animationIsBusy(attacker)) {
+    if (attacker == nullptr || target == nullptr) {
         return false;
     }
 
@@ -589,23 +666,64 @@ static bool realTimeCombatNpcAttack(Object* attacker, Object* target, int hitMod
         return false;
     }
 
-    int savedActionPoints = attacker->data.critter.combat.ap;
-    int actionPointsRequired = weaponGetActionPointCost(attacker, hitMode, false);
-    if (attacker->data.critter.combat.ap < actionPointsRequired) {
-        attacker->data.critter.combat.ap = actionPointsRequired;
-    }
-
-    realTimeCombatFaceObject(attacker, target);
-
-    int rc = _combat_attack(attacker, target, hitMode, HIT_LOCATION_UNCALLED);
-    attacker->data.critter.combat.ap = savedActionPoints;
-
-    return rc == 0;
+    return realTimeCombatPerformAttack(attacker, target, hitMode, false);
 }
 
-static void realTimeCombatFinalizeAttack()
+static void realTimeCombatEnsureCritterDeathAnimation(Object* critter)
 {
-    Attack* attack = combat_get_data();
+    if (critter == nullptr || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+        return;
+    }
+
+    if ((critter->data.critter.combat.results & DAM_DEAD) == 0) {
+        return;
+    }
+
+    int currentAnim = FID_ANIM_TYPE(critter->fid);
+    if (currentAnim == ANIM_FALL_BACK || currentAnim == ANIM_FALL_FRONT) {
+        return;
+    }
+
+    int anim = ANIM_FALL_BACK;
+    int fid = buildFid(FID_TYPE(critter->fid), critter->fid & 0xFFF, anim, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
+    if (!artExists(fid)) {
+        anim = ANIM_FALL_FRONT;
+        fid = buildFid(FID_TYPE(critter->fid), critter->fid & 0xFFF, anim, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
+    }
+
+    if (!artExists(fid)) {
+        return;
+    }
+
+    reg_anim_clear(critter);
+    reg_anim_begin(ANIMATION_REQUEST_RESERVED);
+    animationRegisterAnimate(critter, anim, 0);
+    reg_anim_end();
+}
+
+static void realTimeCombatEnsureAttackDeathAnimations(Attack* attack)
+{
+    if (attack == nullptr) {
+        return;
+    }
+
+    if ((attack->attackerFlags & DAM_DEAD) != 0) {
+        realTimeCombatEnsureCritterDeathAnimation(attack->attacker);
+    }
+
+    if ((attack->defenderFlags & DAM_DEAD) != 0) {
+        realTimeCombatEnsureCritterDeathAnimation(attack->defender);
+    }
+
+    for (int index = 0; index < attack->extrasLength; index++) {
+        if ((attack->extrasFlags[index] & DAM_DEAD) != 0) {
+            realTimeCombatEnsureCritterDeathAnimation(attack->extras[index]);
+        }
+    }
+}
+
+static void realTimeCombatFinalizeAttack(Attack* attack)
+{
     if (attack == nullptr || attack->attacker == nullptr) {
         return;
     }
@@ -621,6 +739,7 @@ static void realTimeCombatFinalizeAttack()
 
     _combat_display(attack);
     _apply_damage(attack, true);
+    realTimeCombatEnsureAttackDeathAnimations(attack);
 }
 
 static void realTimeCombatReload()
@@ -646,7 +765,7 @@ static void realTimeCombatHandleMouse()
     gRangedAimActive = realTimeCombatIsCtrlPressed()
         && (mouseState & MOUSE_EVENT_RIGHT_BUTTON_DOWN_REPEAT) != 0;
 
-    if (animationIsBusy(gDude)) {
+    if (animationIsBusy(gDude) && !realTimeCombatCanInterruptDudeAnimation()) {
         return;
     }
 
@@ -816,12 +935,49 @@ static bool realTimeCombatSyncTileForFootPosition(Object* object, int footX, int
     return true;
 }
 
-static void realTimeCombatHandleMovement()
+static void realTimeCombatUpdateCamera()
 {
-    if (animationIsBusy(gDude)) {
+    int baseX;
+    int baseY;
+    if (tileToScreenXY(gDude->tile, &baseX, &baseY) != 0) {
         return;
     }
 
+    int playerX = baseX + 16 + gDude->x;
+    int playerY = baseY + 8 + gDude->y;
+
+    int viewWidth = screenGetWidth();
+    int viewHeight = screenGetVisibleHeight() - 100;
+    if (viewHeight < ORIGINAL_ISO_WINDOW_HEIGHT) {
+        viewHeight = ORIGINAL_ISO_WINDOW_HEIGHT;
+    }
+
+    int centerX = viewWidth / 2;
+    int centerY = viewHeight / 2;
+    constexpr int kCameraFollowSlackX = 16;
+    constexpr int kCameraFollowSlackY = 12;
+
+    int scrollX = 0;
+    int scrollY = 0;
+    if (playerX < centerX - kCameraFollowSlackX) {
+        scrollX = -1;
+    } else if (playerX > centerX + kCameraFollowSlackX) {
+        scrollX = 1;
+    }
+
+    if (playerY < centerY - kCameraFollowSlackY) {
+        scrollY = -1;
+    } else if (playerY > centerY + kCameraFollowSlackY) {
+        scrollY = 1;
+    }
+
+    if (scrollX != 0 || scrollY != 0) {
+        mapScroll(scrollX, scrollY);
+    }
+}
+
+static void realTimeCombatHandleMovement()
+{
     int dx;
     int dy;
     if (!realTimeCombatGetMovementDelta(&dx, &dy)) {
@@ -829,6 +985,10 @@ static void realTimeCombatHandleMovement()
             _dude_stand(gDude, gDude->rotation, -1);
             gWasMoving = false;
         }
+        return;
+    }
+
+    if (!realTimeCombatInterruptDudeAnimation()) {
         return;
     }
 
@@ -859,7 +1019,7 @@ static void realTimeCombatHandleMovement()
     }
 
     tileWindowRefreshRect(&dirtyRect, gDude->elevation);
-    _tile_scroll_to(gDude->tile, 2);
+    realTimeCombatUpdateCamera();
 
     gWasMoving = true;
 }
@@ -976,7 +1136,7 @@ static void realTimeCombatHandleNpcs()
 
     for (int index = 0; index < critterCount; index++) {
         Object* critter = critters[index];
-        if (!realTimeCombatIsHostileToDude(critter) || animationIsBusy(critter)) {
+        if (!realTimeCombatIsHostileToDude(critter)) {
             continue;
         }
 
@@ -997,7 +1157,6 @@ static void realTimeCombatHandleNpcs()
         }
 
         if (realTimeCombatNpcAttack(critter, gDude, hitMode)) {
-            realTimeCombatFinalizeAttack();
             gNpcLastAttackTimes[critter] = now;
         }
     }

@@ -116,7 +116,7 @@ static bool _check_ranged_miss(Attack* attack);
 static int _shoot_along_path(Attack* attack, int endTile, int rounds, int anim);
 static int _compute_spray(Attack* attack, int accuracy, int* roundsHitMainTargetPtr, int* roundsFiredPtr, int anim);
 static int attackComputeEnhancedKnockout(Attack* attack);
-static int attackCompute(Attack* attack);
+int attackCompute(Attack* attack);
 static int attackComputeCriticalHit(Attack* a1);
 static int _attackFindInvalidFlags(Object* a1, Object* a2);
 static int attackComputeCriticalFailure(Attack* attack);
@@ -3903,7 +3903,7 @@ static int attackComputeEnhancedKnockout(Attack* attack)
 }
 
 // 0x42378C
-static int attackCompute(Attack* attack)
+int attackCompute(Attack* attack)
 {
     int range = weaponGetRange(attack->attacker, attack->hitMode);
     int distance = objectGetDistanceBetween(attack->attacker, attack->defender);
