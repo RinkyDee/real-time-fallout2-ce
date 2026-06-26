@@ -35,6 +35,7 @@
 #include "proto.h"
 #include "queue.h"
 #include "random.h"
+#include "realtime_combat.h"
 #include "scripts.h"
 #include "settings.h"
 #include "sfall_callbacks.h"
@@ -97,7 +98,7 @@ static bool _combat_safety_invalidate_weapon_func(Object* attacker, Object* weap
 static void _combatInitAIInfoList();
 static int aiInfoCopy(int srcIndex, int destIndex);
 static int _combatAIInfoSetLastMove(Object* object, int move);
-static void _combat_begin(Object* attacker);
+static bool _combat_begin(Object* attacker);
 static void _combat_begin_extra(Object* attacker);
 static void _combat_update_critters_in_los(bool a1);
 static void _combat_over();
@@ -2569,8 +2570,13 @@ static int _combatAIInfoSetLastMove(Object* object, int move)
 }
 
 // 0x421A34
-static void _combat_begin(Object* attacker)
+static bool _combat_begin(Object* attacker)
 {
+    if (realTimeCombatShouldBlockClassicCombat()) {
+        realTimeCombatTrace("_combat_begin-blocked", nullptr);
+        return false;
+    }
+
     _combat_turn_running = 0;
     animationStop();
     tickersRemove(_dude_fidget);
@@ -2585,7 +2591,7 @@ static void _combat_begin(Object* attacker)
         _list_com = 0;
         _aiInfoList = (CombatAiInfo*)internal_malloc(sizeof(*_aiInfoList) * _list_total);
         if (_aiInfoList == nullptr) {
-            return;
+            return false;
         }
 
         // NOTE: Uninline.
@@ -2643,6 +2649,8 @@ static void _combat_begin(Object* attacker)
         }
         sfallOnCombatStart();
     }
+
+    return true;
 }
 
 // 0x421C8C
@@ -3429,6 +3437,12 @@ static bool _combat_should_end()
 // 0x422D2C
 void _combat(CombatStartData* csd)
 {
+    realTimeCombatTrace("_combat-entry", csd);
+
+    if (realTimeCombatHandleTurnBasedCombatRequest(csd)) {
+        return;
+    }
+
     ScopedGameMode gm(GameMode::kCombat);
 
     if (csd == nullptr
@@ -3436,7 +3450,9 @@ void _combat(CombatStartData* csd)
         || (csd->defender == nullptr || csd->defender->elevation == gElevation)) {
         bool wasInCombat = (gCombatState & 0x01) != 0;
 
-        _combat_begin(nullptr);
+        if (!_combat_begin(nullptr)) {
+            return;
+        }
 
         int curIndex;
 

@@ -31,6 +31,7 @@
 #include "proto.h"
 #include "proto_instance.h"
 #include "queue.h"
+#include "realtime_combat.h"
 #include "scan_unimplemented.h"
 #include "sfall_arrays.h"
 #include "sfall_global_scripts.h"
@@ -1040,11 +1041,16 @@ int scriptsHandleRequests()
 
     if ((gScriptsRequests & SCRIPT_REQUEST_COMBAT) != 0) {
         if (!_action_explode_running()) {
+            bool useRequestedCombatData = (gScriptsRequests & SCRIPT_REQUEST_0x40) == 0;
+
             // entering combat
             gScriptsRequests &= ~(SCRIPT_REQUEST_0x0400 | SCRIPT_REQUEST_COMBAT);
             memcpy(&gScriptsCSD, &gScriptsRequestedCSD, sizeof(gScriptsCSD));
 
-            if ((gScriptsRequests & SCRIPT_REQUEST_0x40) != 0) {
+            if (realTimeCombatHandleTurnBasedCombatRequest(useRequestedCombatData ? &gScriptsCSD : nullptr)) {
+                gScriptsRequests &= ~SCRIPT_REQUEST_0x40;
+                memset(&gScriptsCSD, 0, sizeof(gScriptsCSD));
+            } else if ((gScriptsRequests & SCRIPT_REQUEST_0x40) != 0) {
                 gScriptsRequests &= ~SCRIPT_REQUEST_0x40;
                 _combat(nullptr);
             } else {
@@ -1121,8 +1127,14 @@ int _scripts_check_state_in_combat()
 // 0x4A457C
 int scriptsRequestCombat(CombatStartData* combat)
 {
+    realTimeCombatTrace("scriptsRequestCombat", combat);
+
     if ((gScriptsRequests & SCRIPT_REQUEST_0x0400) != 0) {
         return -1;
+    }
+
+    if (realTimeCombatHandleTurnBasedCombatRequest(combat)) {
+        return 0;
     }
 
     if (combat) {
@@ -1141,6 +1153,12 @@ int scriptsRequestCombat(CombatStartData* combat)
 // 0x4A45D4
 void _scripts_request_combat_locked(CombatStartData* combat)
 {
+    realTimeCombatTrace("scriptsRequestCombatLocked", combat);
+
+    if (realTimeCombatHandleTurnBasedCombatRequest(combat)) {
+        return;
+    }
+
     if (combat != nullptr) {
         memcpy(&gScriptsRequestedCSD, combat, sizeof(gScriptsRequestedCSD));
     } else {

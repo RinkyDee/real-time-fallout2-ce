@@ -34,6 +34,7 @@
 #include "proto_instance.h"
 #include "queue.h"
 #include "random.h"
+#include "realtime_combat.h"
 #include "script_sound.h"
 #include "scripts.h"
 #include "settings.h"
@@ -769,6 +770,7 @@ void mapNewMap()
     mapSetElevation(0);
     tileSetCenter(20100, TILE_SET_CENTER_FLAG_IGNORE_SCROLL_RESTRICTIONS);
     memset(&gMapTransition, 0, sizeof(gMapTransition));
+    realTimeCombatClearPendingMap();
     gMapHeader.enteringElevation = 0;
     gMapHeader.enteringRotation = 0;
     gMapHeader.localVariablesCount = 0;
@@ -795,6 +797,8 @@ int mapLoadByName(char* fileName)
     int rc;
 
     compat_strupr(fileName);
+    realTimeCombatSetPendingMapName(fileName);
+    realTimeCombatTrace("mapLoadByName", nullptr);
 
     rc = -1;
 
@@ -1283,9 +1287,12 @@ int mapSetTransition(MapTransition* transition)
     }
 
     memcpy(&gMapTransition, transition, sizeof(gMapTransition));
+    realTimeCombatSetPendingMap(gMapTransition.map);
+    realTimeCombatTrace("mapSetTransition", nullptr);
 
     if (gMapTransition.map == 0) {
         gMapTransition.map = -2;
+        realTimeCombatClearPendingMap();
     }
 
     if (isInCombat()) {
@@ -1313,6 +1320,7 @@ int mapHandleTransition()
             textObjectsReset();
             wmTownMap(); // nb this is a world map transition
             memset(&gMapTransition, 0, sizeof(gMapTransition));
+            realTimeCombatClearPendingMap();
         }
     } else if (gMapTransition.map == -2) {
         if (!isInCombat()) {
@@ -1321,6 +1329,7 @@ int mapHandleTransition()
             textObjectsReset();
             wmWorldMap();
             memset(&gMapTransition, 0, sizeof(gMapTransition));
+            realTimeCombatClearPendingMap();
         }
     } else {
         if (!isInCombat()) {
@@ -1344,6 +1353,7 @@ int mapHandleTransition()
             }
 
             memset(&gMapTransition, 0, sizeof(gMapTransition));
+            realTimeCombatClearPendingMap();
 
             int city;
             wmMatchAreaContainingMapIdx(gMapHeader.index, &city);
