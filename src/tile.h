@@ -38,6 +38,7 @@ void tileEnable();
 void tileWindowRefreshRect(Rect* rect, int elevation);
 void tileWindowRefresh();
 int tileSetCenter(int tile, int flags);
+int tileSetCenterWithScreenOffset(int tile, int offsetX, int offsetY, int flags);
 void tile_toggle_roof(bool refresh);
 int tileRoofIsVisible();
 int tileToScreenXY(int tile, int* x, int* y);

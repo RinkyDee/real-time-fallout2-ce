@@ -14,6 +14,7 @@
 #include "debug.h"
 #include "game.h"
 #include "game_mouse.h"
+#include "game_sound.h"
 #include "interface.h"
 #include "inventory.h"
 #include "input.h"
@@ -25,7 +26,6 @@
 #include "platform_compat.h"
 #include "scripts.h"
 #include "settings.h"
-#include "svga.h"
 #include "tile.h"
 #include "worldmap.h"
 
@@ -37,21 +37,26 @@ static constexpr int kNpcMovePixelsPerFrame = 2;
 static constexpr int kAttackTargetPadding = 24;
 static constexpr unsigned int kAttackCooldownMs = 650;
 static constexpr unsigned int kNpcAttackCooldownMs = 2200;
+static constexpr unsigned int kDudeAttackAnimationHoldMs = 750;
 
 static unsigned int gLastMoveFrameTime = 0;
 static unsigned int gLastNpcMoveFrameTime = 0;
 static unsigned int gLastAttackTime = 0;
+static unsigned int gLastDudeAttackAnimationTime = 0;
 static bool gWasMoving = false;
-static bool gRangedAimActive = false;
 static bool gCursorModeActive = false;
 static int gSavedMouseCursor = MOUSE_CURSOR_NONE;
 static bool gSavedMouseObjectsVisible = false;
 static int gPendingMap = -1;
 static char gPendingMapName[16];
 static bool gMapTransitionInProgress = false;
+static Object* gLootHoverTarget = nullptr;
 static std::unordered_map<Object*, unsigned int> gNpcLastAttackTimes;
 
 static void realTimeCombatFinalizeAttack(Attack* attack);
+static int realTimeCombatBuildExistingCritterFid(Object* object, int anim, int preferredWeaponAnimationCode = -1);
+static void realTimeCombatSetCritterFidIfNeeded(Object* object, int fid);
+static void realTimeCombatSetCursor(int cursor);
 
 static bool realTimeCombatNameContains(const char* string, const char* pattern)
 {
@@ -258,10 +263,8 @@ static void realTimeCombatEnterCursorMode()
         gameMouseObjectsHide();
     }
 
-    if (enteringCursorMode || gameMouseGetCursor() != MOUSE_CURSOR_ARROW) {
-        mouseHideCursor();
-        gameMouseSetCursor(MOUSE_CURSOR_ARROW);
-        mouseShowCursor();
+    if (enteringCursorMode) {
+        realTimeCombatSetCursor(MOUSE_CURSOR_ARROW);
     }
 }
 
@@ -284,11 +287,26 @@ static void realTimeCombatExitCursorMode()
     gCursorModeActive = false;
 }
 
+static void realTimeCombatClearLootHover()
+{
+    if (gLootHoverTarget == nullptr) {
+        return;
+    }
+
+    Rect dirtyRect;
+    if (objectClearOutline(gLootHoverTarget, &dirtyRect) == 0) {
+        tileWindowRefreshRect(&dirtyRect, gLootHoverTarget->elevation);
+    }
+
+    gLootHoverTarget = nullptr;
+}
+
 void realTimeCombatRefreshCursor()
 {
     if (realTimeCombatIsEnabled()) {
         realTimeCombatEnterCursorMode();
     } else {
+        realTimeCombatClearLootHover();
         realTimeCombatExitCursorMode();
     }
 }
@@ -339,12 +357,6 @@ static bool realTimeCombatFaceObject(Object* object, Object* target)
     return true;
 }
 
-static bool realTimeCombatIsCtrlPressed()
-{
-    return gPressedPhysicalKeys[SDL_SCANCODE_LCTRL] != KEY_STATE_UP
-        || gPressedPhysicalKeys[SDL_SCANCODE_RCTRL] != KEY_STATE_UP;
-}
-
 static int realTimeCombatAbs(int value)
 {
     return value < 0 ? -value : value;
@@ -360,6 +372,19 @@ static bool realTimeCombatCanInterruptDudeAnimation()
     return (gDude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) == 0;
 }
 
+static bool realTimeCombatDudeAttackAnimationIsProtected()
+{
+    if (gLastDudeAttackAnimationTime == 0) {
+        return false;
+    }
+
+    if (getTicksBetween(getTicks(), gLastDudeAttackAnimationTime) < kDudeAttackAnimationHoldMs) {
+        return true;
+    }
+
+    return animationIsBusy(gDude) != 0;
+}
+
 static bool realTimeCombatInterruptDudeAnimation()
 {
     if (!animationIsBusy(gDude)) {
@@ -373,31 +398,94 @@ static bool realTimeCombatInterruptDudeAnimation()
     return reg_anim_clear(gDude) != -2;
 }
 
+static void realTimeCombatSetCursor(int cursor)
+{
+    if (gameMouseGetCursor() == cursor) {
+        return;
+    }
+
+    mouseHideCursor();
+    gameMouseSetCursor(cursor);
+    mouseShowCursor();
+}
+
 static bool realTimeCombatIsReloadHitMode(int hitMode)
 {
     return hitMode == HIT_MODE_LEFT_WEAPON_RELOAD
         || hitMode == HIT_MODE_RIGHT_WEAPON_RELOAD;
 }
 
+static bool realTimeCombatHitModeMatchesRange(Object* weapon, int hitMode, bool ranged)
+{
+    if (realTimeCombatIsReloadHitMode(hitMode)) {
+        return false;
+    }
+
+    if (weapon == nullptr && !isUnarmedHitMode(hitMode)) {
+        return false;
+    }
+
+    int attackType = weaponGetAttackTypeForHitMode(weapon, hitMode);
+    bool isRangedAttack = attackType == ATTACK_TYPE_RANGED || attackType == ATTACK_TYPE_THROW;
+    return ranged ? isRangedAttack : !isRangedAttack;
+}
+
+static bool realTimeCombatGetFallbackAttackMode(bool ranged, int* hitMode)
+{
+    int hand = interfaceGetCurrentHand();
+    Object* weapon = hand == HAND_RIGHT ? critterGetItem2(gDude) : critterGetItem1(gDude);
+
+    if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+        if (ranged) {
+            return false;
+        }
+
+        *hitMode = HIT_MODE_PUNCH;
+        return true;
+    }
+
+    int primaryHitMode = hand == HAND_RIGHT ? HIT_MODE_RIGHT_WEAPON_PRIMARY : HIT_MODE_LEFT_WEAPON_PRIMARY;
+    if (realTimeCombatHitModeMatchesRange(weapon, primaryHitMode, ranged)) {
+        *hitMode = primaryHitMode;
+        return true;
+    }
+
+    int secondaryHitMode = hand == HAND_RIGHT ? HIT_MODE_RIGHT_WEAPON_SECONDARY : HIT_MODE_LEFT_WEAPON_SECONDARY;
+    if (realTimeCombatHitModeMatchesRange(weapon, secondaryHitMode, ranged)) {
+        *hitMode = secondaryHitMode;
+        return true;
+    }
+
+    return false;
+}
+
 static bool realTimeCombatGetAttackMode(bool ranged, int* hitMode)
 {
-    if (!interface_get_current_attack_mode(hitMode)) {
-        return false;
+    if (interface_get_current_attack_mode(hitMode)) {
+        Object* weapon = critterGetWeaponForHitMode(gDude, *hitMode);
+        if (weapon == nullptr && !isUnarmedHitMode(*hitMode)) {
+            *hitMode = HIT_MODE_PUNCH;
+        }
+
+        if (realTimeCombatHitModeMatchesRange(weapon, *hitMode, ranged)) {
+            return true;
+        }
     }
 
-    if (realTimeCombatIsReloadHitMode(*hitMode)) {
-        return false;
+    return realTimeCombatGetFallbackAttackMode(ranged, hitMode);
+}
+
+static bool realTimeCombatGetDefaultAttackMode(int* hitMode)
+{
+    if (realTimeCombatGetAttackMode(true, hitMode)) {
+        return true;
     }
 
-    Object* weapon = critterGetWeaponForHitMode(gDude, *hitMode);
-    if (weapon == nullptr && !isUnarmedHitMode(*hitMode)) {
-        *hitMode = HIT_MODE_PUNCH;
+    if (realTimeCombatGetAttackMode(false, hitMode)) {
+        return true;
     }
 
-    int attackType = weaponGetAttackTypeForHitMode(weapon, *hitMode);
-    bool isRangedAttack = attackType == ATTACK_TYPE_RANGED || attackType == ATTACK_TYPE_THROW;
-
-    return ranged ? isRangedAttack : !isRangedAttack;
+    return false;
 }
 
 static bool realTimeCombatGetNpcAttackMode(Object* critter, int* hitMode)
@@ -476,14 +564,32 @@ static Object* realTimeCombatGetTargetUnderCursor()
     return bestTarget;
 }
 
-static Object* realTimeCombatGetItemUnderCursor()
+static bool realTimeCombatIsLootableCritter(Object* target)
 {
-    Object* item = gameMouseGetObjectUnderCursor(OBJ_TYPE_ITEM, false, gDude->elevation);
-    if (item == nullptr || (item->flags & OBJECT_HIDDEN) != 0) {
+    return target != nullptr
+        && target != gDude
+        && FID_TYPE(target->fid) == OBJ_TYPE_CRITTER
+        && (target->flags & OBJECT_HIDDEN) == 0
+        && (target->data.critter.combat.results & DAM_DEAD) != 0
+        && !critterFlagCheck(target->pid, CRITTER_NO_STEAL);
+}
+
+static Object* realTimeCombatGetLootTargetUnderCursor()
+{
+    Object* target = gameMouseGetObjectUnderCursor(-1, true, gDude->elevation);
+    if (target == nullptr || target == gDude || (target->flags & OBJECT_HIDDEN) != 0) {
         return nullptr;
     }
 
-    return item;
+    if (FID_TYPE(target->fid) == OBJ_TYPE_ITEM) {
+        return target;
+    }
+
+    if (realTimeCombatIsLootableCritter(target)) {
+        return target;
+    }
+
+    return nullptr;
 }
 
 static Object* realTimeCombatGetTalkTargetUnderCursor()
@@ -581,15 +687,34 @@ static void realTimeCombatPlayAttackAnimation(Object* attacker, Object* target, 
     }
 
     int anim = critterGetAnimationForHitMode(attacker, hitMode);
-    int fid = buildFid(FID_TYPE(attacker->fid), attacker->fid & 0xFFF, anim, (attacker->fid & 0xF000) >> 12, attacker->rotation + 1);
-    if (!artExists(fid)) {
-        return;
+    Object* weapon = critterGetWeaponForHitMode(attacker, hitMode);
+    int weaponAnimationCode = weapon != nullptr ? weaponGetAnimationCode(weapon) : 0;
+    int fid = realTimeCombatBuildExistingCritterFid(attacker, anim, weaponAnimationCode);
+    bool hasAttackArt = artExists(fid);
+
+    char sfxName[16];
+    if (weapon != nullptr && weaponAnimationCode != 0) {
+        strcpy(sfxName, sfxBuildWeaponName(WEAPON_SOUND_EFFECT_ATTACK, weapon, hitMode, target));
+    } else {
+        strcpy(sfxName, sfxBuildCharName(attacker, anim, CHARACTER_SOUND_EFFECT_UNUSED));
     }
 
     reg_anim_clear(attacker);
+    if (hasAttackArt) {
+        realTimeCombatSetCritterFidIfNeeded(attacker, fid);
+    }
+
+    if (attacker == gDude) {
+        gWasMoving = false;
+        gLastDudeAttackAnimationTime = getTicks();
+    }
+
     reg_anim_begin(ANIMATION_REQUEST_UNRESERVED);
     animationRegisterRotateToTile(attacker, target->tile);
-    animationRegisterAnimate(attacker, anim, 0);
+    animationRegisterPlaySoundEffect(attacker, sfxName, -1);
+    if (hasAttackArt) {
+        animationRegisterAnimate(attacker, anim, 0);
+    }
     reg_anim_end();
 }
 
@@ -722,6 +847,55 @@ static void realTimeCombatEnsureAttackDeathAnimations(Attack* attack)
     }
 }
 
+static void realTimeCombatFinalizeDeadCritterState(Object* critter)
+{
+    if (critter == nullptr || FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
+        return;
+    }
+
+    if ((critter->data.critter.combat.results & DAM_DEAD) == 0) {
+        return;
+    }
+
+    Rect dirtyRect;
+    objectGetRect(critter, &dirtyRect);
+
+    Rect tempRect;
+    if ((critter->flags & OBJECT_NO_BLOCK) == 0) {
+        critter->flags |= OBJECT_NO_BLOCK;
+        if (!critterFlagCheck(critter->pid, CRITTER_FLAT) && _obj_toggle_flat(critter, &tempRect) == 0) {
+            rectUnion(&dirtyRect, &tempRect, &dirtyRect);
+        }
+    }
+
+    if (objectDisableOutline(critter, &tempRect) == 0) {
+        rectUnion(&dirtyRect, &tempRect, &dirtyRect);
+    }
+
+    tileWindowRefreshRect(&dirtyRect, critter->elevation);
+}
+
+static void realTimeCombatFinalizeAttackDeadCritterStates(Attack* attack)
+{
+    if (attack == nullptr) {
+        return;
+    }
+
+    if ((attack->attackerFlags & DAM_DEAD) != 0) {
+        realTimeCombatFinalizeDeadCritterState(attack->attacker);
+    }
+
+    if ((attack->defenderFlags & DAM_DEAD) != 0) {
+        realTimeCombatFinalizeDeadCritterState(attack->defender);
+    }
+
+    for (int index = 0; index < attack->extrasLength; index++) {
+        if ((attack->extrasFlags[index] & DAM_DEAD) != 0) {
+            realTimeCombatFinalizeDeadCritterState(attack->extras[index]);
+        }
+    }
+}
+
 static void realTimeCombatFinalizeAttack(Attack* attack)
 {
     if (attack == nullptr || attack->attacker == nullptr) {
@@ -739,6 +913,7 @@ static void realTimeCombatFinalizeAttack(Attack* attack)
 
     _combat_display(attack);
     _apply_damage(attack, true);
+    realTimeCombatFinalizeAttackDeadCritterStates(attack);
     realTimeCombatEnsureAttackDeathAnimations(attack);
 }
 
@@ -762,15 +937,12 @@ static void realTimeCombatReload()
 static void realTimeCombatHandleMouse()
 {
     int mouseState = mouseGetEvent();
-    gRangedAimActive = realTimeCombatIsCtrlPressed()
-        && (mouseState & MOUSE_EVENT_RIGHT_BUTTON_DOWN_REPEAT) != 0;
 
     if (animationIsBusy(gDude) && !realTimeCombatCanInterruptDudeAnimation()) {
         return;
     }
 
-    if (!realTimeCombatIsCtrlPressed()
-        && (mouseState & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0
+    if ((mouseState & MOUSE_EVENT_RIGHT_BUTTON_DOWN) != 0
         && (mouseState & MOUSE_EVENT_RIGHT_BUTTON_REPEAT) == 0) {
         Object* target = realTimeCombatGetTalkTargetUnderCursor();
         if (target != nullptr) {
@@ -795,35 +967,167 @@ static void realTimeCombatHandleMouse()
         return;
     }
 
-    Object* item = realTimeCombatGetItemUnderCursor();
-    if (item != nullptr) {
-        gWasMoving = false;
-        actionPickUp(gDude, item);
-        return;
-    }
-
-    int hitMode;
-    if (!realTimeCombatGetAttackMode(gRangedAimActive, &hitMode)) {
-        return;
-    }
-
     Object* target = realTimeCombatGetTargetUnderCursor();
-    realTimeCombatAttack(target, hitMode, gRangedAimActive);
+    if (target != nullptr) {
+        int hitMode;
+        if (realTimeCombatGetDefaultAttackMode(&hitMode)) {
+            realTimeCombatAttack(target, hitMode, false);
+        }
+        return;
+    }
+
+    Object* lootTarget = realTimeCombatGetLootTargetUnderCursor();
+    if (lootTarget != nullptr && objectWithinWalkDistance(gDude, lootTarget)) {
+        gWasMoving = false;
+        if (FID_TYPE(lootTarget->fid) == OBJ_TYPE_CRITTER) {
+            actionLootCritter(gDude, lootTarget);
+        } else {
+            actionPickUp(gDude, lootTarget);
+        }
+        return;
+    }
 }
 
-static void realTimeCombatSetObjectMovingAnimation(Object* object, bool moving)
+static void realTimeCombatUpdateLootHover()
 {
-    int anim = moving ? ANIM_RUNNING : ANIM_STAND;
-    if (FID_ANIM_TYPE(object->fid) == anim) {
+    if (realTimeCombatGetTargetUnderCursor() != nullptr) {
+        realTimeCombatClearLootHover();
+        return;
+    }
+
+    Object* target = realTimeCombatGetLootTargetUnderCursor();
+    if (target != nullptr && !objectWithinWalkDistance(gDude, target)) {
+        target = nullptr;
+    }
+
+    if (target == gLootHoverTarget) {
+        return;
+    }
+
+    realTimeCombatClearLootHover();
+
+    if (target == nullptr) {
         return;
     }
 
     Rect dirtyRect;
-    int fid = buildFid(FID_TYPE(object->fid), object->fid & 0xFFF, anim, (object->fid & 0xF000) >> 12, object->rotation + 1);
-    if (moving && !artExists(fid)) {
-        fid = buildFid(FID_TYPE(object->fid), object->fid & 0xFFF, ANIM_WALK, (object->fid & 0xF000) >> 12, object->rotation + 1);
+    if (objectSetOutline(target, OUTLINE_TYPE_ITEM, &dirtyRect) == 0) {
+        tileWindowRefreshRect(&dirtyRect, target->elevation);
+        gLootHoverTarget = target;
+    }
+}
+
+static void realTimeCombatUpdateCombatCursor()
+{
+    int hitMode;
+    Object* target = realTimeCombatGetTargetUnderCursor();
+    if (target != nullptr
+        && realTimeCombatGetAttackMode(true, &hitMode)
+        && realTimeCombatCanAttack(target, hitMode, false)) {
+        realTimeCombatSetCursor(MOUSE_CURSOR_CROSSHAIR);
+        return;
     }
 
+    if (realTimeCombatGetLootTargetUnderCursor() != nullptr) {
+        realTimeCombatSetCursor(MOUSE_CURSOR_ARROW);
+        return;
+    }
+
+    realTimeCombatSetCursor(MOUSE_CURSOR_ARROW);
+}
+
+static int realTimeCombatGetPreferredWeaponAnimationCode(Object* critter)
+{
+    Object* weapon = nullptr;
+
+    if (critter == gDude) {
+        if (interfaceGetActiveItem(&weapon) != 0 || weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+            int hand = interfaceGetCurrentHand();
+            weapon = hand == HAND_RIGHT ? critterGetItem2(gDude) : critterGetItem1(gDude);
+        }
+    } else {
+        weapon = critterGetItem2(critter);
+        if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+            weapon = critterGetItem1(critter);
+        }
+    }
+
+    if (weapon == nullptr || itemGetType(weapon) != ITEM_TYPE_WEAPON) {
+        return 0;
+    }
+
+    return weaponGetAnimationCode(weapon);
+}
+
+static int realTimeCombatBuildExistingCritterFid(Object* object, int anim, int preferredWeaponAnimationCode)
+{
+    int frmId = object->fid & 0xFFF;
+    int currentWeaponAnimationCode = (object->fid & 0xF000) >> 12;
+    int equippedWeaponAnimationCode = realTimeCombatGetPreferredWeaponAnimationCode(object);
+    int weaponAnimationCode = preferredWeaponAnimationCode != -1 ? preferredWeaponAnimationCode : equippedWeaponAnimationCode;
+    int rotations[2] = {
+        object->rotation + 1,
+        FID_ROTATION(object->fid),
+    };
+
+    struct Candidate {
+        int anim;
+        int weaponAnimationCode;
+    };
+
+    Candidate candidates[] = {
+        { anim, weaponAnimationCode },
+        { anim == ANIM_RUNNING ? ANIM_WALK : anim, weaponAnimationCode },
+        { anim, equippedWeaponAnimationCode },
+        { anim == ANIM_RUNNING ? ANIM_WALK : anim, equippedWeaponAnimationCode },
+        { anim, currentWeaponAnimationCode },
+        { anim == ANIM_RUNNING ? ANIM_WALK : anim, currentWeaponAnimationCode },
+        { anim, 0 },
+        { anim == ANIM_RUNNING ? ANIM_WALK : anim, 0 },
+        { ANIM_STAND, weaponAnimationCode },
+        { ANIM_STAND, equippedWeaponAnimationCode },
+        { ANIM_STAND, currentWeaponAnimationCode },
+        { ANIM_STAND, 0 },
+        { FID_ANIM_TYPE(object->fid), weaponAnimationCode },
+        { FID_ANIM_TYPE(object->fid), equippedWeaponAnimationCode },
+        { FID_ANIM_TYPE(object->fid), currentWeaponAnimationCode },
+        { FID_ANIM_TYPE(object->fid), 0 },
+    };
+
+    for (int candidateIndex = 0; candidateIndex < sizeof(candidates) / sizeof(candidates[0]); candidateIndex++) {
+        Candidate candidate = candidates[candidateIndex];
+
+        bool duplicateCandidate = false;
+        for (int previousCandidateIndex = 0; previousCandidateIndex < candidateIndex; previousCandidateIndex++) {
+            if (candidates[previousCandidateIndex].anim == candidate.anim
+                && candidates[previousCandidateIndex].weaponAnimationCode == candidate.weaponAnimationCode) {
+                duplicateCandidate = true;
+                break;
+            }
+        }
+
+        if (duplicateCandidate) {
+            continue;
+        }
+
+        for (int rotationIndex = 0; rotationIndex < 2; rotationIndex++) {
+            int fid = buildFid(FID_TYPE(object->fid), frmId, candidate.anim, candidate.weaponAnimationCode, rotations[rotationIndex]);
+            if (artExists(fid)) {
+                return fid;
+            }
+        }
+    }
+
+    return object->fid;
+}
+
+static void realTimeCombatSetCritterFidIfNeeded(Object* object, int fid)
+{
+    if (object == nullptr || object->fid == fid) {
+        return;
+    }
+
+    Rect dirtyRect;
     if (objectSetFid(object, fid, &dirtyRect) == 0) {
         Rect frameRect;
         objectSetFrame(object, 0, &frameRect);
@@ -832,8 +1136,34 @@ static void realTimeCombatSetObjectMovingAnimation(Object* object, bool moving)
     }
 }
 
+static void realTimeCombatValidateCritterFid(Object* object)
+{
+    if (object == nullptr || FID_TYPE(object->fid) != OBJ_TYPE_CRITTER || artExists(object->fid)) {
+        return;
+    }
+
+    realTimeCombatSetCritterFidIfNeeded(object, realTimeCombatBuildExistingCritterFid(object, FID_ANIM_TYPE(object->fid)));
+}
+
+static void realTimeCombatSetObjectMovingAnimation(Object* object, bool moving)
+{
+    if (object == gDude && realTimeCombatDudeAttackAnimationIsProtected()) {
+        return;
+    }
+
+    int anim = moving ? ANIM_RUNNING : ANIM_STAND;
+    int fid = realTimeCombatBuildExistingCritterFid(object, anim);
+    if (object->fid == fid && artExists(fid)) {
+        return;
+    }
+
+    realTimeCombatSetCritterFidIfNeeded(object, fid);
+}
+
 static void realTimeCombatAdvanceObjectMovingAnimation(Object* object, unsigned int now)
 {
+    realTimeCombatValidateCritterFid(object);
+
     if (getTicksBetween(now, gLastNpcMoveFrameTime) < kMoveFrameDelayMs) {
         return;
     }
@@ -878,6 +1208,8 @@ static void realTimeCombatSetMovingAnimation(bool moving)
 
 static void realTimeCombatAdvanceMovingAnimation()
 {
+    realTimeCombatValidateCritterFid(gDude);
+
     unsigned int now = getTicks();
     if (getTicksBetween(now, gLastMoveFrameTime) < kMoveFrameDelayMs) {
         return;
@@ -935,45 +1267,63 @@ static bool realTimeCombatSyncTileForFootPosition(Object* object, int footX, int
     return true;
 }
 
-static void realTimeCombatUpdateCamera()
+static void realTimeCombatNormalizeMovementVector(int deltaX, int deltaY, int speed, int* dx, int* dy)
 {
-    int baseX;
-    int baseY;
-    if (tileToScreenXY(gDude->tile, &baseX, &baseY) != 0) {
+    int absDeltaX = realTimeCombatAbs(deltaX);
+    int absDeltaY = realTimeCombatAbs(deltaY);
+
+    *dx = 0;
+    *dy = 0;
+
+    if (absDeltaX == 0 && absDeltaY == 0) {
         return;
     }
 
-    int playerX = baseX + 16 + gDude->x;
-    int playerY = baseY + 8 + gDude->y;
+    if (absDeltaX >= absDeltaY) {
+        *dx = deltaX > 0 ? speed : -speed;
+        *dy = absDeltaY == 0 ? 0 : deltaY * speed / absDeltaX;
+    } else {
+        *dx = absDeltaX == 0 ? 0 : deltaX * speed / absDeltaY;
+        *dy = deltaY > 0 ? speed : -speed;
+    }
+}
 
-    int viewWidth = screenGetWidth();
-    int viewHeight = screenGetVisibleHeight() - 100;
-    if (viewHeight < ORIGINAL_ISO_WINDOW_HEIGHT) {
-        viewHeight = ORIGINAL_ISO_WINDOW_HEIGHT;
+static bool realTimeCombatTryMoveObjectByDelta(Object* object, int dx, int dy)
+{
+    if (dx == 0 && dy == 0) {
+        return false;
     }
 
-    int centerX = viewWidth / 2;
-    int centerY = viewHeight / 2;
-    constexpr int kCameraFollowSlackX = 16;
-    constexpr int kCameraFollowSlackY = 12;
+    Rect dirtyRect;
+    objectGetRect(object, &dirtyRect);
 
-    int scrollX = 0;
-    int scrollY = 0;
-    if (playerX < centerX - kCameraFollowSlackX) {
-        scrollX = -1;
-    } else if (playerX > centerX + kCameraFollowSlackX) {
-        scrollX = 1;
+    int baseX;
+    int baseY;
+    if (tileToScreenXY(object->tile, &baseX, &baseY) != 0) {
+        return false;
     }
 
-    if (playerY < centerY - kCameraFollowSlackY) {
-        scrollY = -1;
-    } else if (playerY > centerY + kCameraFollowSlackY) {
-        scrollY = 1;
+    int footX = baseX + 16 + object->x + dx;
+    int footY = baseY + 8 + object->y + dy;
+    bool changedTile;
+    if (!realTimeCombatSyncTileForFootPosition(object, footX, footY, &dirtyRect, &changedTile)) {
+        return false;
     }
 
-    if (scrollX != 0 || scrollY != 0) {
-        mapScroll(scrollX, scrollY);
+    if (!changedTile) {
+        Rect offsetRect;
+        if (_obj_offset(object, dx, dy, &offsetRect) == 0) {
+            rectUnion(&dirtyRect, &offsetRect, &dirtyRect);
+        }
     }
+
+    tileWindowRefreshRect(&dirtyRect, object->elevation);
+    return true;
+}
+
+static void realTimeCombatUpdateCamera()
+{
+    tileSetCenterWithScreenOffset(gDude->tile, -gDude->x, -gDude->y, TILE_SET_CENTER_REFRESH_WINDOW);
 }
 
 static void realTimeCombatHandleMovement()
@@ -981,19 +1331,30 @@ static void realTimeCombatHandleMovement()
     int dx;
     int dy;
     if (!realTimeCombatGetMovementDelta(&dx, &dy)) {
+        bool attackAnimationProtected = realTimeCombatDudeAttackAnimationIsProtected();
         if (gWasMoving) {
-            _dude_stand(gDude, gDude->rotation, -1);
+            if (!attackAnimationProtected) {
+                realTimeCombatSetObjectMovingAnimation(gDude, false);
+            }
             gWasMoving = false;
+        } else if (!animationIsBusy(gDude)
+            && !attackAnimationProtected
+            && (gDude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) == 0
+            && FID_ANIM_TYPE(gDude->fid) != ANIM_STAND) {
+            realTimeCombatSetObjectMovingAnimation(gDude, false);
         }
         return;
     }
 
-    if (!realTimeCombatInterruptDudeAnimation()) {
+    bool attackAnimationProtected = realTimeCombatDudeAttackAnimationIsProtected();
+    if (!attackAnimationProtected && !realTimeCombatInterruptDudeAnimation()) {
         return;
     }
 
-    realTimeCombatSetMovingAnimation(true);
-    realTimeCombatAdvanceMovingAnimation();
+    if (!attackAnimationProtected) {
+        realTimeCombatSetMovingAnimation(true);
+        realTimeCombatAdvanceMovingAnimation();
+    }
 
     Rect dirtyRect;
     objectGetRect(gDude, &dirtyRect);
@@ -1079,45 +1440,86 @@ static bool realTimeCombatMoveNpcTowardDude(Object* critter, unsigned int now)
 
     int deltaX = dudeFootX - critterFootX;
     int deltaY = dudeFootY - critterFootY;
-    int absDeltaX = realTimeCombatAbs(deltaX);
-    int absDeltaY = realTimeCombatAbs(deltaY);
-    if (absDeltaX == 0 && absDeltaY == 0) {
+    if (deltaX == 0 && deltaY == 0) {
         return false;
-    }
-
-    int dx = 0;
-    int dy = 0;
-    if (absDeltaX >= absDeltaY) {
-        dx = deltaX > 0 ? kNpcMovePixelsPerFrame : -kNpcMovePixelsPerFrame;
-        dy = absDeltaY == 0 ? 0 : deltaY * kNpcMovePixelsPerFrame / absDeltaX;
-    } else {
-        dx = absDeltaX == 0 ? 0 : deltaX * kNpcMovePixelsPerFrame / absDeltaY;
-        dy = deltaY > 0 ? kNpcMovePixelsPerFrame : -kNpcMovePixelsPerFrame;
     }
 
     realTimeCombatFaceObject(critter, gDude);
     realTimeCombatSetObjectMovingAnimation(critter, true);
     realTimeCombatAdvanceObjectMovingAnimation(critter, now);
 
-    Rect dirtyRect;
-    objectGetRect(critter, &dirtyRect);
-
-    int footX = critterFootX + dx;
-    int footY = critterFootY + dy;
-    bool changedTile;
-    if (!realTimeCombatSyncTileForFootPosition(critter, footX, footY, &dirtyRect, &changedTile)) {
-        return false;
+    int directDx;
+    int directDy;
+    realTimeCombatNormalizeMovementVector(deltaX, deltaY, kNpcMovePixelsPerFrame, &directDx, &directDy);
+    if (realTimeCombatTryMoveObjectByDelta(critter, directDx, directDy)) {
+        return true;
     }
 
-    if (!changedTile) {
-        Rect offsetRect;
-        if (_obj_offset(critter, dx, dy, &offsetRect) == 0) {
-            rectUnion(&dirtyRect, &offsetRect, &dirtyRect);
+    struct MoveCandidate {
+        int dx;
+        int dy;
+    };
+
+    MoveCandidate candidates[10];
+    int candidateCount = 0;
+
+    unsigned char rotations[800];
+    int pathLength = pathfinderFindPath(critter, critter->tile, gDude->tile, rotations, 0, _obj_blocking_at);
+    if (pathLength > 0) {
+        int nextTile = tileGetTileInDirection(critter->tile, rotations[0], 1);
+        if (tileIsValid(nextTile)) {
+            int nextTileX;
+            int nextTileY;
+            if (tileToScreenXY(nextTile, &nextTileX, &nextTileY) == 0) {
+                realTimeCombatNormalizeMovementVector(nextTileX + 16 - critterFootX,
+                    nextTileY + 8 - critterFootY,
+                    kNpcMovePixelsPerFrame,
+                    &(candidates[candidateCount].dx),
+                    &(candidates[candidateCount].dy));
+                candidateCount++;
+            }
         }
     }
 
-    tileWindowRefreshRect(&dirtyRect, critter->elevation);
-    return true;
+    int directRotation = tileGetRotationTo(critter->tile, gDude->tile);
+    int rotationOffsets[5] = { 1, 5, 2, 4, 3 };
+    for (int index = 0; index < 5; index++) {
+        int rotation = (directRotation + rotationOffsets[index]) % ROTATION_COUNT;
+        int tile = tileGetTileInDirection(critter->tile, rotation, 1);
+        if (!tileIsValid(tile)) {
+            continue;
+        }
+
+        int tileX;
+        int tileY;
+        if (tileToScreenXY(tile, &tileX, &tileY) != 0) {
+            continue;
+        }
+
+        realTimeCombatNormalizeMovementVector(tileX + 16 - critterFootX,
+            tileY + 8 - critterFootY,
+            kNpcMovePixelsPerFrame,
+            &(candidates[candidateCount].dx),
+            &(candidates[candidateCount].dy));
+        candidateCount++;
+    }
+
+    for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
+        bool duplicateCandidate = false;
+        for (int previousCandidateIndex = 0; previousCandidateIndex < candidateIndex; previousCandidateIndex++) {
+            if (candidates[previousCandidateIndex].dx == candidates[candidateIndex].dx
+                && candidates[previousCandidateIndex].dy == candidates[candidateIndex].dy) {
+                duplicateCandidate = true;
+                break;
+            }
+        }
+
+        if (!duplicateCandidate && realTimeCombatTryMoveObjectByDelta(critter, candidates[candidateIndex].dx, candidates[candidateIndex].dy)) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static void realTimeCombatHandleNpcs()
@@ -1198,8 +1600,11 @@ bool realTimeCombatUpdate(int keyCode)
         realTimeCombatReload();
     }
 
+    realTimeCombatValidateCritterFid(gDude);
     realTimeCombatFaceMouse();
     realTimeCombatHandleMouse();
+    realTimeCombatUpdateLootHover();
+    realTimeCombatUpdateCombatCursor();
     realTimeCombatHandleMovement();
     realTimeCombatHandleNpcs();
 

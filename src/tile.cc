@@ -654,6 +654,31 @@ int tileSetCenter(int tile, int flags)
     return 0;
 }
 
+int tileSetCenterWithScreenOffset(int tile, int offsetX, int offsetY, int flags)
+{
+    int rc = tileSetCenter(tile, flags & ~TILE_SET_CENTER_REFRESH_WINDOW);
+    if (rc == -1) {
+        return -1;
+    }
+
+    _tile_offx += offsetX;
+    _tile_offy += offsetY;
+
+    _square_offx = _tile_offx - 16;
+    _square_offy = _tile_offy - 2;
+
+    if (_tile_y & 1) {
+        _square_offy -= 12;
+        _square_offx -= 16;
+    }
+
+    if ((flags & TILE_SET_CENTER_REFRESH_WINDOW) != 0) {
+        tileWindowRefresh();
+    }
+
+    return 0;
+}
+
 // Port of HRP EdgeClipping::CheckRect.
 // Returns true if any corner of the screen-space rect maps to a tile outside the 200x200 grid.
 bool checkRectNeedsClear(const Rect* rect, int elevation)
