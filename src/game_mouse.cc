@@ -30,6 +30,7 @@
 #include "party_member.h"
 #include "proto.h"
 #include "proto_instance.h"
+#include "realtime_combat.h"
 #include "settings.h"
 #include "skill.h"
 #include "skilldex.h"
@@ -521,6 +522,11 @@ int _gmouse_is_scrolling()
 void gameMouseRefresh()
 {
     if (!gGameMouseInitialized) {
+        return;
+    }
+
+    if (realTimeCombatIsEnabled()) {
+        realTimeCombatRefreshCursor();
         return;
     }
 

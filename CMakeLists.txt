@@ -320,6 +320,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     ${FALLOUT_ENGINE_SOURCES}
     "src/main.cc"
     "src/main.h"
+    "src/realtime_combat.cc"
+    "src/realtime_combat.h"
 )
 
 target_sources(${EXECUTABLE_NAME} PUBLIC ${FALLOUT_PLATFORM_SOURCES})

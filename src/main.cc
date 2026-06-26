@@ -31,6 +31,7 @@
 #include "preferences.h"
 #include "proto.h"
 #include "random.h"
+#include "realtime_combat.h"
 #include "scripts.h"
 #include "settings.h"
 #include "sfall_callbacks.h"
@@ -387,7 +388,9 @@ static void mainLoop()
         // SFALL: MainLoopHook.
         sfall_gl_scr_process_main();
 
-        gameHandleKey(keyCode, false);
+        if (!realTimeCombatUpdate(keyCode)) {
+            gameHandleKey(keyCode, false);
+        }
 
         scriptsHandleRequests();
 
