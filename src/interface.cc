@@ -462,7 +462,7 @@ int interfaceInit()
         return intface_fatal_error(-1);
     }
 
-    gSkilldexButton = buttonCreate(gInterfaceBarWindow, 523 + gInterfaceBarContentOffset, 6, 22, 21, -1, -1, -1, KEY_LOWERCASE_S, _skilldexButtonNormalFrmImage.getData(), _skilldexButtonPressedFrmImage.getData(), nullptr, BUTTON_FLAG_TRANSPARENT);
+    gSkilldexButton = buttonCreate(gInterfaceBarWindow, 523 + gInterfaceBarContentOffset, 6, 22, 21, -1, -1, -1, KEY_INTERFACE_SKILLDEX, _skilldexButtonNormalFrmImage.getData(), _skilldexButtonPressedFrmImage.getData(), nullptr, BUTTON_FLAG_TRANSPARENT);
     if (gSkilldexButton == -1) {
         // NOTE: Uninline.
         return intface_fatal_error(-1);

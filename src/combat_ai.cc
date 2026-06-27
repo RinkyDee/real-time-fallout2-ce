@@ -940,6 +940,23 @@ int aiGetDisposition(Object* obj)
     return ai->disposition;
 }
 
+// Real-time combat helper. Mirrors the flee condition used by _combat_ai so an
+// external real-time AI layer can decide to run away with the original rules
+// (already fleeing, hurt in a packet-disqualifying way, or below min hp).
+bool aiCombatShouldFlee(Object* critter)
+{
+    if (critter == nullptr) {
+        return false;
+    }
+
+    AiPacket* ai = aiGetPacket(critter);
+    CritterCombatData* combatData = &(critter->data.critter.combat);
+
+    return (combatData->maneuver & CRITTER_MANUEVER_FLEEING) != 0
+        || (combatData->results & ai->hurt_too_much) != 0
+        || critterGetStat(critter, STAT_CURRENT_HIT_POINTS) < ai->min_hp;
+}
+
 // 0x428354
 int aiSetDisposition(Object* obj, int disposition)
 {

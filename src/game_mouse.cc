@@ -525,7 +525,7 @@ void gameMouseRefresh()
         return;
     }
 
-    if (realTimeCombatIsEnabled()) {
+    if (realTimeCombatIsEnabled() && !realTimeCombatIsSkillTargetingActive()) {
         realTimeCombatRefreshCursor();
         return;
     }

@@ -696,6 +696,10 @@ int gameHandleKey(int eventCode, bool isInCombatMode)
             }
         }
         break;
+    case KEY_INTERFACE_SKILLDEX:
+        // Dedicated code for the on-screen SKILLDEX button. In real-time combat
+        // 'S' is bound to movement, so the button cannot share KEY_LOWERCASE_S.
+        // FALLTHROUGH
     case KEY_UPPERCASE_S:
     case KEY_LOWERCASE_S:
         // skilldex

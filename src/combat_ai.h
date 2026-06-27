@@ -50,6 +50,7 @@ void aiSetBurstDisabled(Object* critter, bool disable);
 void aiRemoveBurstDisabled(Object* critter);
 int aiGetDisposition(Object* obj);
 int aiSetDisposition(Object* obj, int a2);
+bool aiCombatShouldFlee(Object* critter);
 int _caiSetupTeamCombat(Object* attackerTeam, Object* defenderTeam);
 int _caiTeamCombatInit(Object** crittersList, int crittersListLength);
 void _caiTeamCombatExit();

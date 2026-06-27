@@ -33,14 +33,43 @@ namespace fallout {
 
 static constexpr unsigned int kMoveFrameDelayMs = 75;
 static constexpr int kMovePixelsPerFrame = 4;
-static constexpr int kNpcMovePixelsPerFrame = 2;
+// NPC continuous-movement speed (pixels/frame). Slightly slower than the player
+// so the player can still kite, but fast enough to close in.
+static constexpr int kNpcMovePixelsPerFrame = 3;
 static constexpr int kAttackTargetPadding = 24;
 static constexpr unsigned int kAttackCooldownMs = 650;
 static constexpr unsigned int kNpcAttackCooldownMs = 2200;
 static constexpr unsigned int kDudeAttackAnimationHoldMs = 750;
+// How long after an NPC starts an attack to leave its attack animation alone
+// before real-time movement may resume / interrupt it.
+static constexpr unsigned int kNpcAttackAnimationHoldMs = 700;
+// How often a pursuing critter recomputes its detour path around walls while it
+// cannot see the player in a straight line.
+static constexpr unsigned int kNpcRepathIntervalMs = 250;
+// Maximum number of path waypoints cached per critter.
+static constexpr int kNpcPathMax = 48;
+// Spacing (pixels) between samples when testing a straight walk line.
+static constexpr int kNpcLineSampleSpacing = 12;
+// How far a fleeing critter tries to run from the player in one move.
+static constexpr int kNpcFleeDistance = 8;
+
+// Per-critter real-time AI bookkeeping. NPC movement is continuous and pixel
+// based (like the player): the critter homes straight toward the player when it
+// has a clear walk line, and otherwise follows a cached pathfinder detour around
+// walls. The tile stays authoritative for collision/scripts; only the visible
+// motion is freed from the hex grid.
+struct NpcAiState {
+    unsigned int lastAttackTime = 0;
+    unsigned int lastPathTime = 0;
+    unsigned int lastFrameAdvanceTime = 0;
+    int pathTiles[kNpcPathMax];
+    int pathLength = 0;
+    int pathIndex = 0;
+    int pathTargetTile = -1;
+    int fleeTile = -1;
+};
 
 static unsigned int gLastMoveFrameTime = 0;
-static unsigned int gLastNpcMoveFrameTime = 0;
 static unsigned int gLastAttackTime = 0;
 static unsigned int gLastDudeAttackAnimationTime = 0;
 static bool gWasMoving = false;
@@ -51,7 +80,7 @@ static int gPendingMap = -1;
 static char gPendingMapName[16];
 static bool gMapTransitionInProgress = false;
 static Object* gLootHoverTarget = nullptr;
-static std::unordered_map<Object*, unsigned int> gNpcLastAttackTimes;
+static std::unordered_map<Object*, NpcAiState> gNpcAiStates;
 
 static void realTimeCombatFinalizeAttack(Attack* attack);
 static int realTimeCombatBuildExistingCritterFid(Object* object, int anim, int preferredWeaponAnimationCode = -1);
@@ -301,9 +330,29 @@ static void realTimeCombatClearLootHover()
     gLootHoverTarget = nullptr;
 }
 
+bool realTimeCombatIsSkillTargetingActive()
+{
+    switch (gameMouseGetMode()) {
+    case GAME_MOUSE_MODE_USE_CROSSHAIR:
+    case GAME_MOUSE_MODE_USE_FIRST_AID:
+    case GAME_MOUSE_MODE_USE_DOCTOR:
+    case GAME_MOUSE_MODE_USE_LOCKPICK:
+    case GAME_MOUSE_MODE_USE_STEAL:
+    case GAME_MOUSE_MODE_USE_TRAPS:
+    case GAME_MOUSE_MODE_USE_SCIENCE:
+    case GAME_MOUSE_MODE_USE_REPAIR:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void realTimeCombatRefreshCursor()
 {
-    if (realTimeCombatIsEnabled()) {
+    // While a Skilldex skill is being aimed at a target, hand the cursor back to
+    // the classic game-mouse handler so it can show the use-crosshair and run the
+    // skill-on-target click logic.
+    if (realTimeCombatIsEnabled() && !realTimeCombatIsSkillTargetingActive()) {
         realTimeCombatEnterCursorMode();
     } else {
         realTimeCombatClearLootHover();
@@ -357,14 +406,14 @@ static bool realTimeCombatFaceObject(Object* object, Object* target)
     return true;
 }
 
-static int realTimeCombatAbs(int value)
-{
-    return value < 0 ? -value : value;
-}
-
 static int realTimeCombatSquared(int value)
 {
     return value * value;
+}
+
+static int realTimeCombatAbs(int value)
+{
+    return value < 0 ? -value : value;
 }
 
 static bool realTimeCombatCanInterruptDudeAnimation()
@@ -645,7 +694,7 @@ static bool realTimeCombatCanAttack(Object* target, int hitMode, bool aiming)
     return badShot == COMBAT_BAD_SHOT_OK;
 }
 
-static bool realTimeCombatCanNpcAttack(Object* attacker, Object* target, int hitMode)
+static int realTimeCombatNpcBadShotReason(Object* attacker, Object* target, int hitMode)
 {
     int savedActionPoints = attacker->data.critter.combat.ap;
     int actionPointsRequired = weaponGetActionPointCost(attacker, hitMode, false);
@@ -656,7 +705,12 @@ static bool realTimeCombatCanNpcAttack(Object* attacker, Object* target, int hit
     int badShot = _combat_check_bad_shot(attacker, target, hitMode, false);
     attacker->data.critter.combat.ap = savedActionPoints;
 
-    return badShot == COMBAT_BAD_SHOT_OK;
+    return badShot;
+}
+
+static bool realTimeCombatCanNpcAttack(Object* attacker, Object* target, int hitMode)
+{
+    return realTimeCombatNpcBadShotReason(attacker, target, hitMode) == COMBAT_BAD_SHOT_OK;
 }
 
 static void realTimeCombatNotifyAttackTarget(Object* target, Object* weapon)
@@ -1160,20 +1214,6 @@ static void realTimeCombatSetObjectMovingAnimation(Object* object, bool moving)
     realTimeCombatSetCritterFidIfNeeded(object, fid);
 }
 
-static void realTimeCombatAdvanceObjectMovingAnimation(Object* object, unsigned int now)
-{
-    realTimeCombatValidateCritterFid(object);
-
-    if (getTicksBetween(now, gLastNpcMoveFrameTime) < kMoveFrameDelayMs) {
-        return;
-    }
-
-    Rect dirtyRect;
-    if (objectSetNextFrame(object, &dirtyRect) == 0) {
-        tileWindowRefreshRect(&dirtyRect, object->elevation);
-    }
-}
-
 static int realTimeCombatNormalizeAxis(int negativeKey, int positiveKey)
 {
     bool negative = gPressedPhysicalKeys[negativeKey] != KEY_STATE_UP;
@@ -1264,60 +1304,6 @@ static bool realTimeCombatSyncTileForFootPosition(Object* object, int footX, int
         scriptsExecSpatialProc(gDude, gDude->tile, gDude->elevation);
     }
 
-    return true;
-}
-
-static void realTimeCombatNormalizeMovementVector(int deltaX, int deltaY, int speed, int* dx, int* dy)
-{
-    int absDeltaX = realTimeCombatAbs(deltaX);
-    int absDeltaY = realTimeCombatAbs(deltaY);
-
-    *dx = 0;
-    *dy = 0;
-
-    if (absDeltaX == 0 && absDeltaY == 0) {
-        return;
-    }
-
-    if (absDeltaX >= absDeltaY) {
-        *dx = deltaX > 0 ? speed : -speed;
-        *dy = absDeltaY == 0 ? 0 : deltaY * speed / absDeltaX;
-    } else {
-        *dx = absDeltaX == 0 ? 0 : deltaX * speed / absDeltaY;
-        *dy = deltaY > 0 ? speed : -speed;
-    }
-}
-
-static bool realTimeCombatTryMoveObjectByDelta(Object* object, int dx, int dy)
-{
-    if (dx == 0 && dy == 0) {
-        return false;
-    }
-
-    Rect dirtyRect;
-    objectGetRect(object, &dirtyRect);
-
-    int baseX;
-    int baseY;
-    if (tileToScreenXY(object->tile, &baseX, &baseY) != 0) {
-        return false;
-    }
-
-    int footX = baseX + 16 + object->x + dx;
-    int footY = baseY + 8 + object->y + dy;
-    bool changedTile;
-    if (!realTimeCombatSyncTileForFootPosition(object, footX, footY, &dirtyRect, &changedTile)) {
-        return false;
-    }
-
-    if (!changedTile) {
-        Rect offsetRect;
-        if (_obj_offset(object, dx, dy, &offsetRect) == 0) {
-            rectUnion(&dirtyRect, &offsetRect, &dirtyRect);
-        }
-    }
-
-    tileWindowRefreshRect(&dirtyRect, object->elevation);
     return true;
 }
 
@@ -1419,7 +1405,71 @@ static bool realTimeCombatIsHostileToDude(Object* critter)
         && critter->data.critter.combat.team != gDude->data.critter.combat.team;
 }
 
-static bool realTimeCombatMoveNpcTowardDude(Object* critter, unsigned int now)
+// Cap a screen-space delta to a per-frame step of `speed` pixels while keeping
+// its direction, so a critter can move toward any point at an arbitrary angle
+// (not just along the six hex directions).
+static void realTimeCombatNpcNormalizeVector(int deltaX, int deltaY, int speed, int* dx, int* dy)
+{
+    int absDeltaX = realTimeCombatAbs(deltaX);
+    int absDeltaY = realTimeCombatAbs(deltaY);
+
+    *dx = 0;
+    *dy = 0;
+
+    if (absDeltaX == 0 && absDeltaY == 0) {
+        return;
+    }
+
+    if (absDeltaX >= absDeltaY) {
+        *dx = deltaX > 0 ? speed : -speed;
+        *dy = absDeltaY == 0 ? 0 : deltaY * speed / absDeltaX;
+    } else {
+        *dx = absDeltaX == 0 ? 0 : deltaX * speed / absDeltaY;
+        *dy = deltaY > 0 ? speed : -speed;
+    }
+}
+
+// Move a critter by a screen-space pixel delta exactly like the player moves:
+// shift the sprite by the offset and resynchronize the authoritative tile when
+// the foot crosses a tile boundary (validated by _obj_blocking_at). Returns
+// false when the step would enter a blocked tile.
+static bool realTimeCombatNpcMoveFootBy(Object* critter, int dx, int dy)
+{
+    if (dx == 0 && dy == 0) {
+        return false;
+    }
+
+    Rect dirtyRect;
+    objectGetRect(critter, &dirtyRect);
+
+    int baseX;
+    int baseY;
+    if (tileToScreenXY(critter->tile, &baseX, &baseY) != 0) {
+        return false;
+    }
+
+    int footX = baseX + 16 + critter->x + dx;
+    int footY = baseY + 8 + critter->y + dy;
+    bool changedTile;
+    if (!realTimeCombatSyncTileForFootPosition(critter, footX, footY, &dirtyRect, &changedTile)) {
+        return false;
+    }
+
+    if (!changedTile) {
+        Rect offsetRect;
+        if (_obj_offset(critter, dx, dy, &offsetRect) == 0) {
+            rectUnion(&dirtyRect, &offsetRect, &dirtyRect);
+        }
+    }
+
+    tileWindowRefreshRect(&dirtyRect, critter->elevation);
+    return true;
+}
+
+// Step the critter one frame toward a screen point (a tile center or the
+// player's exact foot position). Reports the applied pixel delta so the caller
+// can face the movement direction.
+static bool realTimeCombatNpcStepTowardPoint(Object* critter, int targetX, int targetY)
 {
     int baseX;
     int baseY;
@@ -1427,99 +1477,325 @@ static bool realTimeCombatMoveNpcTowardDude(Object* critter, unsigned int now)
         return false;
     }
 
-    int dudeBaseX;
-    int dudeBaseY;
-    if (tileToScreenXY(gDude->tile, &dudeBaseX, &dudeBaseY) != 0) {
-        return false;
-    }
+    int footX = baseX + 16 + critter->x;
+    int footY = baseY + 8 + critter->y;
 
-    int critterFootX = baseX + 16 + critter->x;
-    int critterFootY = baseY + 8 + critter->y;
-    int dudeFootX = dudeBaseX + 16 + gDude->x;
-    int dudeFootY = dudeBaseY + 8 + gDude->y;
+    int dx;
+    int dy;
+    realTimeCombatNpcNormalizeVector(targetX - footX, targetY - footY, kNpcMovePixelsPerFrame, &dx, &dy);
 
-    int deltaX = dudeFootX - critterFootX;
-    int deltaY = dudeFootY - critterFootY;
-    if (deltaX == 0 && deltaY == 0) {
-        return false;
-    }
+    return realTimeCombatNpcMoveFootBy(critter, dx, dy);
+}
 
-    realTimeCombatFaceObject(critter, gDude);
-    realTimeCombatSetObjectMovingAnimation(critter, true);
-    realTimeCombatAdvanceObjectMovingAnimation(critter, now);
-
-    int directDx;
-    int directDy;
-    realTimeCombatNormalizeMovementVector(deltaX, deltaY, kNpcMovePixelsPerFrame, &directDx, &directDy);
-    if (realTimeCombatTryMoveObjectByDelta(critter, directDx, directDy)) {
+// True when a straight walk line from `fromX,fromY` to `toX,toY` crosses no
+// blocked tiles (walls or other critters), so the critter can home directly
+// instead of hugging the hex grid. The endpoint tile is ignored so the player's
+// own (blocking) tile does not fail the test.
+static bool realTimeCombatNpcLineIsClear(Object* critter, int fromX, int fromY, int toX, int toY, int targetTile)
+{
+    int deltaX = toX - fromX;
+    int deltaY = toY - fromY;
+    int span = realTimeCombatAbs(deltaX) > realTimeCombatAbs(deltaY)
+        ? realTimeCombatAbs(deltaX)
+        : realTimeCombatAbs(deltaY);
+    int steps = span / kNpcLineSampleSpacing;
+    if (steps < 1) {
         return true;
     }
 
-    struct MoveCandidate {
-        int dx;
-        int dy;
-    };
+    for (int index = 1; index <= steps; index++) {
+        int sampleX = fromX + deltaX * index / steps;
+        int sampleY = fromY + deltaY * index / steps;
+        int tile = tileFromScreenXY(sampleX, sampleY);
+        if (!tileIsValid(tile)) {
+            return false;
+        }
 
-    MoveCandidate candidates[10];
-    int candidateCount = 0;
+        if (tile == critter->tile || tile == targetTile) {
+            continue;
+        }
+
+        if (_obj_blocking_at(critter, tile, critter->elevation) != nullptr) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static void realTimeCombatFaceTile(Object* critter, int tile)
+{
+    if (!tileIsValid(tile) || tile == critter->tile) {
+        return;
+    }
+
+    int rotation = tileGetRotationTo(critter->tile, tile);
+    if (rotation == critter->rotation) {
+        return;
+    }
+
+    Rect dirtyRect;
+    if (objectSetRotation(critter, rotation, &dirtyRect) == 0) {
+        tileWindowRefreshRect(&dirtyRect, critter->elevation);
+    }
+}
+
+// Stand in place facing the player. Used while waiting on the attack cooldown,
+// holding distance, or when blocked. Keeps idle critters on a clean STAND frame.
+static void realTimeCombatNpcHold(Object* critter)
+{
+    if (animationIsBusy(critter)) {
+        return;
+    }
+
+    realTimeCombatFaceObject(critter, gDude);
+    realTimeCombatSetObjectMovingAnimation(critter, false);
+}
+
+// Drive the critter's walk/run animation manually, the same way the player's
+// movement is animated, since these critters are no longer played through the
+// engine's tile-move animation.
+static void realTimeCombatNpcAnimateMovement(Object* critter, NpcAiState& state, unsigned int now)
+{
+    realTimeCombatSetObjectMovingAnimation(critter, true);
+    realTimeCombatValidateCritterFid(critter);
+
+    if (getTicksBetween(now, state.lastFrameAdvanceTime) < kMoveFrameDelayMs) {
+        return;
+    }
+
+    Rect dirtyRect;
+    if (objectSetNextFrame(critter, &dirtyRect) == 0) {
+        tileWindowRefreshRect(&dirtyRect, critter->elevation);
+    }
+
+    state.lastFrameAdvanceTime = now;
+}
+
+// Cache a pathfinder route to the player, used only when a wall blocks the
+// straight line. Prefers a collision-free route; if none exists (crowded
+// corner) it plans one that ignores other critters so the critter still commits
+// to heading around the wall.
+static void realTimeCombatNpcComputePath(Object* critter, NpcAiState& state, unsigned int now)
+{
+    state.pathLength = 0;
+    state.pathIndex = 0;
+    state.pathTargetTile = gDude->tile;
+    state.lastPathTime = now;
 
     unsigned char rotations[800];
-    int pathLength = pathfinderFindPath(critter, critter->tile, gDude->tile, rotations, 0, _obj_blocking_at);
-    if (pathLength > 0) {
-        int nextTile = tileGetTileInDirection(critter->tile, rotations[0], 1);
-        if (tileIsValid(nextTile)) {
-            int nextTileX;
-            int nextTileY;
-            if (tileToScreenXY(nextTile, &nextTileX, &nextTileY) == 0) {
-                realTimeCombatNormalizeMovementVector(nextTileX + 16 - critterFootX,
-                    nextTileY + 8 - critterFootY,
-                    kNpcMovePixelsPerFrame,
-                    &(candidates[candidateCount].dx),
-                    &(candidates[candidateCount].dy));
-                candidateCount++;
+    int length = pathfinderFindPath(critter, critter->tile, gDude->tile, rotations, 0, _obj_blocking_at);
+    if (length <= 0) {
+        length = pathfinderFindPath(critter, critter->tile, gDude->tile, rotations, 0, _obj_ai_blocking_at);
+        if (length <= 0) {
+            return;
+        }
+    }
+
+    int tile = critter->tile;
+    int count = length < kNpcPathMax ? length : kNpcPathMax;
+    for (int index = 0; index < count; index++) {
+        tile = tileGetTileInDirection(tile, rotations[index], 1);
+        state.pathTiles[index] = tile;
+    }
+
+    state.pathLength = count;
+}
+
+// Continuous, pixel-based pursuit. Homes straight toward the player when the
+// walk line is clear; otherwise follows the cached pathfinder detour waypoint
+// by waypoint. Either way the motion is off-grid and tracks the player's
+// current position, instead of hopping between hex centers toward a stale goal.
+static void realTimeCombatNpcPursue(Object* critter, NpcAiState& state, unsigned int now)
+{
+    int critterBaseX;
+    int critterBaseY;
+    if (tileToScreenXY(critter->tile, &critterBaseX, &critterBaseY) != 0) {
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+    int critterFootX = critterBaseX + 16 + critter->x;
+    int critterFootY = critterBaseY + 8 + critter->y;
+
+    int dudeBaseX;
+    int dudeBaseY;
+    if (tileToScreenXY(gDude->tile, &dudeBaseX, &dudeBaseY) != 0) {
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+    int dudeFootX = dudeBaseX + 16 + gDude->x;
+    int dudeFootY = dudeBaseY + 8 + gDude->y;
+
+    int targetTile;
+    int targetX;
+    int targetY;
+
+    if (realTimeCombatNpcLineIsClear(critter, critterFootX, critterFootY, dudeFootX, dudeFootY, gDude->tile)) {
+        // Clear line of sight: charge straight at the player at any angle.
+        state.pathLength = 0;
+        targetTile = gDude->tile;
+        targetX = dudeFootX;
+        targetY = dudeFootY;
+    } else {
+        // A wall is in the way: route around it using a cached detour path.
+        if (state.pathLength == 0
+            || state.pathIndex >= state.pathLength
+            || getTicksBetween(now, state.lastPathTime) >= kNpcRepathIntervalMs) {
+            realTimeCombatNpcComputePath(critter, state, now);
+        }
+
+        while (state.pathIndex < state.pathLength && critter->tile == state.pathTiles[state.pathIndex]) {
+            state.pathIndex++;
+        }
+
+        if (state.pathLength == 0 || state.pathIndex >= state.pathLength) {
+            realTimeCombatNpcHold(critter);
+            return;
+        }
+
+        targetTile = state.pathTiles[state.pathIndex];
+        int waypointBaseX;
+        int waypointBaseY;
+        if (tileToScreenXY(targetTile, &waypointBaseX, &waypointBaseY) != 0) {
+            realTimeCombatNpcHold(critter);
+            return;
+        }
+        targetX = waypointBaseX + 16;
+        targetY = waypointBaseY + 8;
+    }
+
+    if (!realTimeCombatNpcStepTowardPoint(critter, targetX, targetY)) {
+        // Blocked by a critter directly ahead (or already on the spot): wait.
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+
+    realTimeCombatFaceTile(critter, targetTile);
+    realTimeCombatNpcAnimateMovement(critter, state, now);
+}
+
+// Continuous flee: run in a straight line toward a reachable tile away from the
+// player (mirrors _ai_run_away's destination search), repicking when reached or
+// blocked.
+static void realTimeCombatNpcFlee(Object* critter, NpcAiState& state, unsigned int now)
+{
+    if (state.fleeTile < 0
+        || critter->tile == state.fleeTile
+        || getTicksBetween(now, state.lastPathTime) >= kNpcRepathIntervalMs) {
+        state.fleeTile = -1;
+        state.lastPathTime = now;
+
+        int awayRotation = tileGetRotationTo(gDude->tile, critter->tile);
+        int rotationOffsets[3] = { 0, 1, ROTATION_COUNT - 1 };
+        for (int distance = kNpcFleeDistance; distance > 0 && state.fleeTile < 0; distance--) {
+            for (int index = 0; index < 3; index++) {
+                int rotation = (awayRotation + rotationOffsets[index]) % ROTATION_COUNT;
+                int tile = tileGetTileInDirection(critter->tile, rotation, distance);
+                if (tileIsValid(tile)
+                    && pathfinderFindPath(critter, critter->tile, tile, nullptr, 1, _obj_blocking_at) > 0) {
+                    state.fleeTile = tile;
+                    break;
+                }
             }
         }
     }
 
-    int directRotation = tileGetRotationTo(critter->tile, gDude->tile);
-    int rotationOffsets[5] = { 1, 5, 2, 4, 3 };
-    for (int index = 0; index < 5; index++) {
-        int rotation = (directRotation + rotationOffsets[index]) % ROTATION_COUNT;
-        int tile = tileGetTileInDirection(critter->tile, rotation, 1);
-        if (!tileIsValid(tile)) {
-            continue;
-        }
-
-        int tileX;
-        int tileY;
-        if (tileToScreenXY(tile, &tileX, &tileY) != 0) {
-            continue;
-        }
-
-        realTimeCombatNormalizeMovementVector(tileX + 16 - critterFootX,
-            tileY + 8 - critterFootY,
-            kNpcMovePixelsPerFrame,
-            &(candidates[candidateCount].dx),
-            &(candidates[candidateCount].dy));
-        candidateCount++;
+    if (state.fleeTile < 0) {
+        realTimeCombatNpcHold(critter);
+        return;
     }
 
-    for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
-        bool duplicateCandidate = false;
-        for (int previousCandidateIndex = 0; previousCandidateIndex < candidateIndex; previousCandidateIndex++) {
-            if (candidates[previousCandidateIndex].dx == candidates[candidateIndex].dx
-                && candidates[previousCandidateIndex].dy == candidates[candidateIndex].dy) {
-                duplicateCandidate = true;
-                break;
+    int destBaseX;
+    int destBaseY;
+    if (tileToScreenXY(state.fleeTile, &destBaseX, &destBaseY) != 0) {
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+
+    if (!realTimeCombatNpcStepTowardPoint(critter, destBaseX + 16, destBaseY + 8)) {
+        state.fleeTile = -1;
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+
+    realTimeCombatFaceTile(critter, state.fleeTile);
+    realTimeCombatNpcAnimateMovement(critter, state, now);
+}
+
+// Per-critter real-time AI decision, mirroring the branches of _ai_try_attack /
+// _combat_ai. Movement is continuous and pixel based (see realTimeCombatNpcPursue);
+// only attacks/deaths use the engine's registered animations.
+static void realTimeCombatUpdateNpc(Object* critter, unsigned int now)
+{
+    NpcAiState& state = gNpcAiStates[critter];
+
+    // Let our own attack animation play out before acting again.
+    if (state.lastAttackTime != 0
+        && getTicksBetween(now, state.lastAttackTime) < kNpcAttackAnimationHoldMs) {
+        return;
+    }
+
+    // Keep the real-time AI authoritative over hostile critters: interrupt any
+    // lingering registered animation (e.g. a script-issued idle/wander move) so
+    // it doesn't override our continuous pixel movement and make the critter
+    // appear to meander. Leave knockdown/get-up reactions and prioritized
+    // sequences (deaths, scripted) alone.
+    if (animationIsBusy(critter)) {
+        if ((critter->data.critter.combat.results & DAM_KNOCKED_DOWN) != 0) {
+            return;
+        }
+
+        if (reg_anim_clear(critter) == -2) {
+            return;
+        }
+    }
+
+    int hitMode;
+    if (!realTimeCombatGetNpcAttackMode(critter, &hitMode)) {
+        realTimeCombatNpcHold(critter);
+        return;
+    }
+
+    // Flee when the original rules say to (hurt too much / below min hp).
+    if (aiCombatShouldFlee(critter)) {
+        critter->data.critter.combat.maneuver |= CRITTER_MANUEVER_FLEEING;
+        realTimeCombatNpcFlee(critter, state, now);
+        return;
+    }
+    state.fleeTile = -1;
+
+    int reason = realTimeCombatNpcBadShotReason(critter, gDude, hitMode);
+
+    if (reason == COMBAT_BAD_SHOT_NO_AMMO) {
+        aiAttemptWeaponReload(critter, 1);
+        return;
+    }
+
+    if (reason == COMBAT_BAD_SHOT_OK) {
+        bool cooldownReady = state.lastAttackTime == 0
+            || getTicksBetween(now, state.lastAttackTime) >= kNpcAttackCooldownMs;
+        if (cooldownReady) {
+            if (realTimeCombatNpcAttack(critter, gDude, hitMode)) {
+                state.lastAttackTime = now;
             }
+        } else {
+            realTimeCombatNpcHold(critter);
         }
-
-        if (!duplicateCandidate && realTimeCombatTryMoveObjectByDelta(critter, candidates[candidateIndex].dx, candidates[candidateIndex].dy)) {
-            return true;
-        }
+        return;
     }
 
-    return false;
+    if (reason == COMBAT_BAD_SHOT_OUT_OF_RANGE || reason == COMBAT_BAD_SHOT_AIM_BLOCKED) {
+        if (aiGetDistance(critter) == DISTANCE_STAY) {
+            realTimeCombatNpcHold(critter);
+            return;
+        }
+
+        realTimeCombatNpcPursue(critter, state, now);
+        return;
+    }
+
+    // Crippled arms / not enough AP / anything else: hold and face the player.
+    realTimeCombatNpcHold(critter);
 }
 
 static void realTimeCombatHandleNpcs()
@@ -1542,29 +1818,10 @@ static void realTimeCombatHandleNpcs()
             continue;
         }
 
-        int hitMode;
-        if (!realTimeCombatGetNpcAttackMode(critter, &hitMode)) {
-            continue;
-        }
-
-        int range = weaponGetRange(critter, hitMode);
-        if (objectGetDistanceBetween(critter, gDude) > range) {
-            realTimeCombatMoveNpcTowardDude(critter, now);
-            continue;
-        }
-
-        unsigned int lastAttackTime = gNpcLastAttackTimes[critter];
-        if (lastAttackTime != 0 && getTicksBetween(now, lastAttackTime) < kNpcAttackCooldownMs) {
-            continue;
-        }
-
-        if (realTimeCombatNpcAttack(critter, gDude, hitMode)) {
-            gNpcLastAttackTimes[critter] = now;
-        }
+        realTimeCombatUpdateNpc(critter, now);
     }
 
     objectListFree(critters);
-    gLastNpcMoveFrameTime = now;
 }
 
 static bool realTimeCombatConsumesKey(int keyCode)
@@ -1581,6 +1838,9 @@ static bool realTimeCombatConsumesKey(int keyCode)
     case KEY_UPPERCASE_D:
     case KEY_LOWERCASE_R:
     case KEY_UPPERCASE_R:
+        // WASD/R drive real-time movement and reload. 'S' is always movement now;
+        // the SKILLDEX button uses its own KEY_INTERFACE_SKILLDEX code so it no
+        // longer collides here.
         return true;
     default:
         return false;
@@ -1592,8 +1852,25 @@ bool realTimeCombatUpdate(int keyCode)
     realTimeCombatRefreshCursor();
 
     if (!realTimeCombatIsEnabled()) {
-        gNpcLastAttackTimes.clear();
+        gNpcAiStates.clear();
         return false;
+    }
+
+    // While a Skilldex skill is being targeted (e.g. lockpick on a door), stand
+    // aside so the classic game-mouse handler resolves the click via
+    // actionUseSkill. Movement and NPC AI keep running (real-time combat does
+    // not pause); only RTC's own mouse/cursor/attack handling is suspended.
+    if (realTimeCombatIsSkillTargetingActive()) {
+        realTimeCombatHandleMovement();
+        realTimeCombatHandleNpcs();
+        // Let the mouse event (-2) reach gameHandleKey, which dispatches it to
+        // _gmouse_handle_event so the classic handler resolves the skill-on-
+        // target click via actionUseSkill. Movement keys stay swallowed so 'A'
+        // and friends don't fall through to legacy combat shortcuts.
+        if (keyCode == -2) {
+            return false;
+        }
+        return realTimeCombatConsumesKey(keyCode);
     }
 
     if (keyCode == KEY_LOWERCASE_R || keyCode == KEY_UPPERCASE_R) {

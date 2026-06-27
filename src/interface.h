@@ -12,6 +12,12 @@ namespace fallout {
 #define INTERFACE_BAR_WIDTH 640
 #define INTERFACE_BAR_HEIGHT 100
 
+// Dedicated event code for the on-screen SKILLDEX button. Real-time combat binds
+// the 'S' key to movement, so the button must not share the KEY_LOWERCASE_S code
+// (otherwise pressing 'S' to move can open Skilldex). gameHandleKey maps this to
+// skilldexOpen and RTC never swallows it.
+#define KEY_INTERFACE_SKILLDEX (-21)
+
 // Minimum radiation amount to display RADIATED indicator.
 #define RADATION_INDICATOR_THRESHOLD 65
 
